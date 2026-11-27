@@ -174,6 +174,12 @@ jobs:
           }
           Copy-Item C:\v\installed\x64-windows\bin\*.dll $stage
           Copy-Item C:\dovi\bin\*.dll $stage
+          # The CI links the runner's OpenSSL dynamically (official packages link it
+          # statically), so ship the exact runtime it was built against.
+          foreach ($dll in 'libcrypto-3-x64.dll','libssl-3-x64.dll') {
+            $from = Join-Path 'C:\Program Files\OpenSSL\bin' $dll
+            if (Test-Path $from) { Copy-Item $from $stage }
+          }
           & "$env:QT_ROOT_DIR\bin\windeployqt.exe" --release --qmldir qml --no-translations `
             --skip-plugin-types qmltooling,generic "$stage\veyra_qml_ui.exe"
           if ($LASTEXITCODE -ne 0) { throw "windeployqt failed with exit code $LASTEXITCODE" }
