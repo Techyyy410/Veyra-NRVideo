@@ -88,7 +88,10 @@ static const float DUPLICATE_COST = 0.006; // per-pixel mean |dL| of a repeated 
 static const float RELIABLE_RATIO = 0.6;   // best / mean cost must be below this
 static const float RELIABLE_COST  = 0.10;
 static const float CUT_COST       = 0.14;
-static const int   UNRELIABLE_RUN = 8;     // frames without a lock before the history is dropped
+static const int   UNRELIABLE_RUN = 8;
+// Motion below this (canvas texels/frame) counts as still, so estimate jitter
+// on a near-still camera does not walk the offsets and smear the edge.
+static const float MOTION_DEADZONE = 0.35;     // frames without a lock before the history is dropped
 
 uint StateFlags() { return uint(stateTex[uint2(STATE_FRAME, 0)].w + 0.5); }
 

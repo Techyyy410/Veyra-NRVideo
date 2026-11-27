@@ -114,6 +114,7 @@ void main(uint thread : SV_GroupIndex)
             track.zw = 0; run = 0; valid = frame;
         } else if (reliable) {
             track.zw = shiftHalf * 2.0;           // half texel = 2 canvas texels
+            if (length(track.zw) < MOTION_DEADZONE) track.zw = 0;
             track.xy = float2(WrapOffset(track.x - track.z, canvasSize.x),
                               WrapOffset(track.y - track.w, canvasSize.y));
             run = 0;

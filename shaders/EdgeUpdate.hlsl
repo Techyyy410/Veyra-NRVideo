@@ -29,10 +29,15 @@ void main(uint3 id : SV_DispatchThreadID)
     [unroll] for (int y = -1; y <= 1; ++y)
         [unroll] for (int x = -1; x <= 1; ++x)
             hud = max(hud, hudMask[clamp(q + int2(x, y), 0, last)]);
-    if (hud > asfloat(ec3.x)) return;
+    const uint2 at = WrapCanvas(texel);
+    if (hud > asfloat(ec3.x)) {
+        // Hidden behind HUD now: whatever the canvas held here is out of date,
+        // so mark it unknown (ambient) rather than leave a stale patch.
+        if (edge) stampR[at] = 0; else stampL[at] = 0;
+        return;
+    }
     const float4 color = float4(sourceTex.SampleLevel(linearClamp, uv, 0).rgb, 1);
     const uint frame = uint(stateTex[uint2(STATE_FRAME, 0)].x + 0.5);
-    const uint2 at = WrapCanvas(texel);
     if (edge) { canvasR[at] = color; stampR[at] = frame; }
     else      { canvasL[at] = color; stampL[at] = frame; }
 }
