@@ -326,12 +326,15 @@ struct GraphicsPass {
     // all 16, including neutral values when the curve flag is off.
     bool create(ID3D12Device* device, const std::vector<uint8_t>& vs,
                 const std::vector<uint8_t>& ps, UINT heapSlots, DXGI_FORMAT outputFormat=DXGI_FORMAT_R8G8B8A8_UNORM,
-                UINT constantCount=16)
+                UINT constantCount=16, UINT srvCount=1, bool alphaBlend=false)
     {
-        if(constantCount==0||constantCount>62)return false;
+        // srvCount > 1 and alphaBlend are for overlay passes (EdgeFill): a
+        // table of several SRVs, a second static sampler s1 (bilinear, wrap)
+        // and source-alpha blending that leaves the target's alpha alone.
+        if(constantCount==0||constantCount>62||srvCount==0)return false;
         D3D12_DESCRIPTOR_RANGE1 srvRange{};
         srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        srvRange.NumDescriptors = 1;
+        srvRange.NumDescriptors = srvCount;
         srvRange.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
         D3D12_STATIC_SAMPLER_DESC sampler{};
         sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -341,6 +344,9 @@ struct GraphicsPass {
         sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
         sampler.ShaderRegister = 0;
         sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_STATIC_SAMPLER_DESC samplers[2]{sampler,sampler};
+        samplers[1].AddressU = samplers[1].AddressV = samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samplers[1].ShaderRegister = 1;
         D3D12_ROOT_PARAMETER1 rp[2]{};
         rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -354,8 +360,8 @@ struct GraphicsPass {
         rd.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
         rd.Desc_1_1.NumParameters = 2;
         rd.Desc_1_1.pParameters = rp;
-        rd.Desc_1_1.NumStaticSamplers = 1;
-        rd.Desc_1_1.pStaticSamplers = &sampler;
+        rd.Desc_1_1.NumStaticSamplers = srvCount > 1 ? 2 : 1;
+        rd.Desc_1_1.pStaticSamplers = samplers;
         ComPtr<ID3DBlob> sig, err;
         if (FAILED(D3D12SerializeVersionedRootSignature(&rd, &sig, &err))) return false;
         if (FAILED(device->CreateRootSignature(0, sig->GetBufferPointer(),
@@ -367,6 +373,14 @@ struct GraphicsPass {
         pd.PS.pShaderBytecode = ps.data();
         pd.PS.BytecodeLength = ps.size();
         pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        if(alphaBlend){
+            auto& rt=pd.BlendState.RenderTarget[0];
+            rt.BlendEnable=TRUE;
+            rt.SrcBlend=D3D12_BLEND_SRC_ALPHA;rt.DestBlend=D3D12_BLEND_INV_SRC_ALPHA;rt.BlendOp=D3D12_BLEND_OP_ADD;
+            rt.SrcBlendAlpha=D3D12_BLEND_ZERO;rt.DestBlendAlpha=D3D12_BLEND_ONE;rt.BlendOpAlpha=D3D12_BLEND_OP_ADD;
+            rt.LogicOp=D3D12_LOGIC_OP_NOOP;
+            rt.RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_RED|D3D12_COLOR_WRITE_ENABLE_GREEN|D3D12_COLOR_WRITE_ENABLE_BLUE;
+        }
         pd.SampleMask = UINT_MAX;
         pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;

@@ -161,6 +161,9 @@ bool VideoPresenter::open(gfx::D3D12DeviceContext& ctx,HWND window,pipeline::Enh
     if(exclusionUiEnabled_)for(unsigned i=0;i<2;++i)
         pipeline::makeSrv(ctx.device(),graph.fgInput(i),graph.outputFormat(),
             {pass_.heap->GetCPUDescriptorHandleForHeapStart().ptr+size_t(pipeline::kOutputPoolSlots+6+i)*pass_.increment});
+    // Custom: edge history fill binds the two real-frame slots of this graph.
+    edgeFill_.open(ctx.device(),graph.videoFrameResource(0),graph.videoFrameResource(1),graph.outputFormat(),graph.workWidth(),graph.workHeight());
+    edgeFillKey_=~0ull;edgeFillRan_=false;
     if(!reuse)startDisplayState();
     return true;
 }
@@ -397,6 +400,22 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
     auto* source=generated?graph.generatedFrameResource(slot):graph.videoFrameResource(slot);auto* bb=sink_.currentBackBuffer(&backBufferIndex);if(!bb)return false;
     auto* renderTarget=copyBeforePresent_?compositeTarget_.Get():bb;
     if(!source||!renderTarget)return false;
+    // Custom: edge history fill. Native presentation of an unrotated picture
+    // with side bars only; the history advances once per real source frame.
+    bool edgeFillOn=false;
+    if(edgeFill_.ready()&&!sink_.xess()&&!comparison&&view.quarterTurns()==0){
+        const auto [fillW,fillH]=view.renderedSize(float(rc.right),float(rc.bottom),float(graph.workWidth()),float(graph.workHeight()));
+        edgeFillOn=fillW>0&&fillW+8.0f<float(rc.right);
+        if(edgeFillOn&&!generated&&slot<2){
+            const uint64_t key=(graph.presentationReadyFence(slot,generated)<<1)|uint64_t(slot);
+            if(key!=edgeFillKey_){
+                edgeFillKey_=key;
+                edgeFill_.update(list,slot,source,graph.hdrOutput()&&!graph.hdr10Output(),!edgeFillRan_);
+                edgeFillRan_=true;
+            }
+        }
+    }
+    if(!edgeFillOn)edgeFillRan_=false;
     D3D12_RESOURCE_BARRIER barriers[2]{};
     for(auto& b:barriers){b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition.StateBefore=D3D12_RESOURCE_STATE_COMMON;b.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;}
     barriers[0].Transition.pResource=source;barriers[0].Transition.StateAfter=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -514,6 +533,7 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
         std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list->ResourceBarrier(1,&b);
         if(veyra::log::verboseFrameLogs())veyra::log::info("comparison",std::format("real-frame source={} epoch={} revision={} reference={} mode={} split={} (same leased frame)",identity.sourceFrameId,identity.epoch,identity.settingsRevision,baseReference?"base":"input",comparison,split));
     }
+    if(edgeFillOn)edgeFill_.compose(list,dims,graph.outputFormat());
     const auto bufferWidth=sink_.bufferWidth(),bufferHeight=sink_.bufferHeight();
     const bool overlayReady=frameStatsCorner_>=0&&frameStats_.prepare(ctx.device(),graph.outputFormat());
     if(overlayReady&&sink_.xess()&&!exclusionUiEnabled_&&!xessFrameStatsFailed_){
@@ -785,6 +805,7 @@ void VideoPresenter::close(){
     hasPresented_=false;gpuTimer_.close();compositeTarget_.Reset();exclusionUiTarget_.Reset();exclusionHudlessTarget_.Reset();exclusionUiEnabled_=false;copyBeforePresent_=copyEligible_=false;rtvs_.Reset();
     probeStats_.Reset();probeReadback_.Reset();probeCpuViews_.Reset();probePass_={};probePending_=false;probeFailed_=false;probeNext_={};probeCurve_={};probeIdentity_={};liveCoverage_={};pass_={};sink_.shutdown();
     presentMotionPass_={};presentMotion_={};previousXessWidth_=previousXessHeight_=0;
+    edgeFill_.release();edgeFillKey_=~0ull;edgeFillRan_=false;
     presentationRing_.shutdown();presentationFence_.Reset();presentationQueue_.Reset();
     if(presentationEvent_){CloseHandle(presentationEvent_);presentationEvent_=nullptr;}
     presentationDevice_=nullptr;presentationFormat_=DXGI_FORMAT_UNKNOWN;window_=nullptr;temporarySurface_=nullptr;

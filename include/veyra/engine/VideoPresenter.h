@@ -14,6 +14,7 @@
 #include "veyra/engine/PresentCapture.h"
 #include "veyra/engine/DisplayStateService.h"
 #include "veyra/engine/FullscreenFrameStats.h"
+#include "veyra/engine/EdgeFill.h" // custom: edge history fill in the side bars
 #include <chrono>
 #include <array>
 #include <optional>
@@ -256,6 +257,11 @@ private:
     bool refresh(ID3D12Device*);
     bool ensureXessUiSurfaces(ID3D12Device*,D3D12_RESOURCE_DESC);
     FullscreenFrameStats frameStats_;
+    // Custom: edge history fill (EdgeFill.h). The key identifies the last real
+    // frame it consumed; ran_ says whether the bars were filled last present.
+    EdgeFill edgeFill_;
+    uint64_t edgeFillKey_=~0ull;
+    bool edgeFillRan_=false;
     int frameStatsCorner_=-1;
     bool xessFrameStatsFailed_=false;
 };

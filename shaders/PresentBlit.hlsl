@@ -3,7 +3,7 @@
 // PRESENT and RENDER_TARGET (not UAV), so the present path is a fullscreen
 // triangle sample instead of a compute write.
 
-#include "HdrColor.hlsli"
+#include "PresentColor.hlsli"
 #include "PresentationRotation.hlsli"
 Texture2D<float4> sourceTex : register(t0);
 
@@ -20,41 +20,6 @@ cbuffer PresentBlitConstants : register(b0)
     float4 curve0;  // x=shadow lift EV, y=shadow range nits, z=mid-gray nits, w=highlight start nits
     float4 curve1;  // x=roll-off scale nits, y=peak cap nits (0 = off)
 };
-
-// Lift the shadows without touching the highlights, move the mid-gray reference
-// with the peak held fixed, then roll off and cap the top end.
-float HdrCurveLuminance(float nits, float4 c0, float4 c1)
-{
-    if (c0.x != 0.0 && c0.y > 0.0) {
-        const float w = saturate(1.0 - nits / c0.y);
-        nits *= 1.0 + w * w * (exp2(c0.x) - 1.0);
-    }
-    if (c0.z > 0.0 && abs(c0.z - 203.0) > 0.5) {
-        const float peak = c1.y > 0.0 ? c1.y : 1000.0;
-        if (peak > c0.z + 1.0) {
-            const float g = log(c0.z / peak) / log(203.0 / peak);
-            nits = peak * pow(max(nits / peak, 0.0), g);
-        }
-    }
-    if (c0.w > 0.0 && c1.x > 0.0 && nits > c0.w) nits = c0.w + (nits - c0.w) / (1.0 + (nits - c0.w) / c1.x);
-    if (c1.y > 0.0) nits = min(nits, c1.y);
-    return nits;
-}
-
-float3 HdrCurve(float3 nits, float4 c0, float4 c1)
-{
-    // A per-channel gamma/knee changes hue and clipping negative scRGB removes
-    // BT.2020 colors outside BT.709. Apply one luminance gain to all components.
-    const float y = dot(nits, float3(.212639, .715169, .072192));
-    if (y <= 1e-6) return nits;
-    float3 mapped = nits * (HdrCurveLuminance(y, c0, c1) / y);
-    if (c1.y > 0.0) {
-        const float3 rgb2020 = HdrTo2020(mapped);
-        const float peak = max(max(rgb2020.r, rgb2020.g), rgb2020.b);
-        if (peak > c1.y) mapped *= c1.y / peak;
-    }
-    return mapped;
-}
 
 SamplerState linearClamp : register(s0);
 
@@ -225,23 +190,45 @@ float4 MagnifySample(float2 p,int2 last)
     return clamp(result,min(min(a,b),min(c,d)),max(max(a,b),max(c,d)));
 }
 
-// Ordered dither for the 12 -> 10 bit quantisation.
-//
-// The reconstruction produces 12 bits and the swapchain takes 10 (R10G10B10A2_UNORM).
-// A 16-float texture is written by the shader and the hardware truncates it to 10 bits
-// when the swapchain is resolved, so a smooth gradient that crosses one 10-bit step
-// shows as a visible band. Adding a sub-LSB offset before that truncation turns the
-// step into noise the eye averages away.
-//
-// The pattern is an 8x8 interleaved gradient noise (Jimenez 2014): cheap, no texture,
-// and its visual character is stable under motion - a random offset would crawl.
-// The amplitude is exactly one 10-bit step (1/1023) scaled to the shader's output
-// domain, so the dither never moves a value by more than half a step either way.
-float DitherOffset(uint2 pixel)
+// ---------------------------------------------------------------------------
+// MOD: ambient bar fill. Instead of black letterbox/pillarbox bars, the bars show
+// a mirrored, heavily blurred, dimmed continuation of the picture's nearest edge
+// (like YouTube's ambient mode). The picture itself is not touched. Tune here:
+static const float AMBIENT_BLUR_NEAR = 0.012; // blur radius next to the picture (fraction of picture height)
+static const float AMBIENT_BLUR_FAR  = 0.10;  // blur radius at the outer screen edge
+static const float AMBIENT_DIM_NEAR  = 0.55;  // brightness next to the picture (1 = full)
+static const float AMBIENT_DIM_FAR   = 0.10;  // brightness at the outer screen edge
+static const int   AMBIENT_TAPS      = 128;   // blur samples per bar pixel (quality vs GPU cost)
+
+// viewUv: display-space uv (picture = 0..1), outside the picture. Returns the
+// blurred colour and, in dim, how much to darken it.
+float4 AmbientFill(float2 viewUv,uint turns,uint2 pixel,out float dim)
 {
-    float noise = frac(52.9829189 * frac(dot(float2(pixel), float2(0.06711056, 0.00583715))));
-    return (noise - 0.5) / 1023.0;
+    // How far the bars reach in uv on each side, so 0..1 across the bar.
+    const float fit=min(dstDims.x/srcDims.x,dstDims.y/srcDims.y)*srcDims.w;
+    const float2 k=dstDims.xy/(srcDims.xy*fit);
+    const float2 lo=-.5*k+dstDims.zw,hi=.5*k+dstDims.zw;
+    const float2 over=max(max(-viewUv,viewUv-1),0);
+    const float2 extent=max(float2(viewUv.x<0?-lo.x:hi.x-1,viewUv.y<0?-lo.y:hi.y-1),1e-4);
+    const float t=saturate(max(over.x/extent.x,over.y/extent.y));
+    dim=lerp(AMBIENT_DIM_NEAR,AMBIENT_DIM_FAR,smoothstep(0,1,t));
+    // Mirror across the picture edge so the bar starts with what is at the edge.
+    float2 m=select(viewUv<0,-viewUv,select(viewUv>1,2-viewUv,viewUv));
+    m=saturate(m);
+    const float radius=lerp(AMBIENT_BLUR_NEAR,AMBIENT_BLUR_FAR,t);
+    const float2 r2=float2(radius*srcDims.y/srcDims.x,radius); // round in screen space
+    // Vogel spiral, rotated per pixel so undersampling reads as fine grain
+    // instead of ghost copies of bright HUD elements.
+    const float rot=6.2831853*frac(52.9829189*frac(dot(float2(pixel),float2(0.06711056,0.00583715))));
+    float3 sum=0;
+    [loop]for(int i=0;i<AMBIENT_TAPS;++i){
+        float s,c;sincos(i*2.39996323+rot,s,c);
+        const float2 o=float2(c,s)*sqrt((i+.5)/AMBIENT_TAPS)*r2;
+        sum+=sourceTex.SampleLevel(linearClamp,PresentationSourceUv(saturate(m+o),turns),0).rgb;
+    }
+    return float4(sum/AMBIENT_TAPS,1);
 }
+// ---------------------------------------------------------------------------
 
 float4 psMain(VSOut input) : SV_Target
 {
@@ -254,6 +241,7 @@ float4 psMain(VSOut input) : SV_Target
         outside=any(uv<0)||any(uv>1);
     }
     uint flags=uint(srcDims.z+0.5);
+    const float2 viewUv=uv; // MOD: display-space uv, kept for the ambient fill
     uv=PresentationSourceUv(uv,(flags>>6)&3);
     // Texel position and its screen derivatives, taken before the letterbox exit
     // so every pixel of a quad still has them (derivatives in divergent flow are
@@ -262,29 +250,17 @@ float4 psMain(VSOut input) : SV_Target
     const float2 size=float2(width,height);
     const float2 p=uv*size-0.5;
     const float2 dx=ddx(p),dy=ddy(p);
-    if(outside)return float4(0,0,0,(flags&256)?0:1);
+    // MOD: the alpha round-trip path (256) keeps transparent bars.
+    if(outside&&(flags&256))return float4(0,0,0,0);
     float4 color;
-    if(flags&2){
+    float ambientDim=1;
+    if(outside)color=AmbientFill(viewUv,(flags>>6)&3,uint2(input.pos.xy),ambientDim);
+    else if(flags&2){
         // Source texels per output pixel along each source axis (a quarter turn
         // swaps which screen axis drives which).
         const float2 scale=max(abs(dx),abs(dy));
         const int2 last=int2(width,height)-1;
         color=all(scale<1.001)?MagnifySample(p,last):MinifySample(p,max(scale,1.0),size);
     }else color=sourceTex.SampleLevel(linearClamp,uv,0);
-    if((flags&256)&&color.a>1e-6)color.rgb/=color.a;
-    if(flags&32)color.rgb=HdrDecodePq(color.rgb);
-    if(flags&8)color.rgb*=203.0/80.0; // SDR comparison white in an HDR output.
-    // Custom: static HDR curve, on absolute nits (the working space is linear
-    // scRGB, 1.0 = 80 nits), before the transfer function is encoded.
-    if(flags&16)color.rgb=HdrCurve(color.rgb*80.0,curve0,curve1)/80.0;
-    if(flags&1){float3 c=max(color.rgb,0);color.rgb=lerp(1.055*pow(c,1.0/2.4)-0.055,c*12.92,step(c,0.0031308));}
-    if(flags&4)color.rgb=HdrEncodePq(color.rgb);
-    if(flags&256)color.rgb*=color.a;
-    // Custom dither (moved off 256, which now carries the alpha round trip): the
-    // offset belongs after the transfer encode, where one 10-bit step is exact.
-    if(flags&512){
-        const int2 p=int2(input.pos.xy);
-        color.rgb=saturate(color.rgb+DitherOffset(uint2(p)));
-    }
-    return color;
+    return PresentFinish(color,flags,uint2(input.pos.xy),ambientDim,curve0,curve1);
 }
